@@ -1,210 +1,17 @@
-// server.js — Proxy para descargar el PDF oficial de iThenticate
-// Requisitos: node >= 18, puppeteer
-
+// server.js
 import express from "express";
 import puppeteer from "puppeteer";
-import fs from "fs";
-import path from "path";
-import os from "os";
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const API_KEY = process.env.PROXY_API_KEY || process.env.API_KEY;
 const ITH_USER = process.env.ITHENTICATE_USERNAME;
 const ITH_PASS = process.env.ITHENTICATE_PASSWORD;
 const RENDER_WAIT_MS = parseInt(process.env.RENDER_WAIT_MS || "8000", 10);
 
-if (!API_KEY) console.warn("[proxy] WARNING: PROXY_API_KEY not set");
-if (!ITH_USER || !ITH_PASS) console.warn("[proxy] WARNING: ITHENTICATE_USERNAME/PASSWORD not set");
-
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---------- helpers ----------
-
-function checkAuth(req, res) {
-  const key = req.header("x-api-key");
-  if (!API_KEY) {
-    res.status(500).json({ error: "PROXY_API_KEY not set" });
-    return false;
-  }
-  if (key !== API_KEY) {
-    res.status(401).json({ error: "Unauthorized" });
-    return false;
-  }
-  return true;
-}
-
-async function launchBrowser(downloadDir) {
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-zygote",
-      "--single-process",
-      "--window-size=1400,1000",
-    ],
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1400, height: 1000 });
-  const client = await page.target().createCDPSession();
-  await client.send("Page.setDownloadBehavior", {
-    behavior: "allow",
-    downloadPath: downloadDir,
-  });
-  return { browser, page, client };
-}
-
-// ---------- login ----------
-
-async function findLoginInputs(page) {
-  const sel =
-    'input[type="email"], input[name="email"], input[name="login"], input[name="username"], input#username, input#email, input#login';
-  // intenta en la página principal
-  const main = await page.$(sel);
-  if (main) {
-    const which = await main.evaluate((el) => {
-      if (el.id) return `#${el.id}`;
-      if (el.name) return `input[name="${el.name}"]`;
-      return 'input[type="email"]';
-    });
-    return { frame: page, userSel: which };
-  }
-  // intenta en iframes
-  for (const frame of page.frames()) {
-    const el = await frame.$(sel).catch(() => null);
-    if (el) {
-      const which = await el.evaluate((node) => {
-        if (node.id) return `#${node.id}`;
-        if (node.name) return `input[name="${node.name}"]`;
-        return 'input[type="email"]';
-      });
-      return { frame, userSel: which };
-    }
-  }
-  return null;
-}
-
-async function login(page) {
-  // Ir directo al endpoint de login real
-  await page.goto("https://app.ithenticate.com/en_us/login", {
-    waitUntil: "networkidle2",
-    timeout: 60000,
-  });
-
-  let target = null;
-  for (let i = 0; i < 30; i++) {
-    target = await findLoginInputs(page);
-    if (target) break;
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
-  if (!target) {
-    const html = await page.content();
-    console.error("[proxy] login HTML head:", html.slice(0, 2000));
-    throw new Error("No se encontró el formulario de login de iThenticate");
-  }
-
-  await target.frame.waitForSelector('input[type="password"]', { timeout: 30000 });
-
-  await target.frame.type(target.userSel, ITH_USER, { delay: 25 });
-  await target.frame.type('input[type="password"]', ITH_PASS, { delay: 25 });
-
-  await Promise.all([
-    page
-      .waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 })
-      .catch(() => {}),
-    target.frame
-      .click('button[type="submit"], input[type="submit"]')
-      .catch(async () => {
-        await page.keyboard.press("Enter");
-      }),
-  ]);
-}
-
-// ---------- descarga del PDF desde el visor ----------
-
-async function clickDownloadInViewer(page) {
-  // Espera a que el visor cargue
-  await new Promise((r) => setTimeout(r, RENDER_WAIT_MS));
-
-  const selectors = [
-    'a[title*="Download" i]',
-    'button[title*="Download" i]',
-    'a[aria-label*="Download" i]',
-    'button[aria-label*="Download" i]',
-    'a[title*="Print" i]',
-    'button[title*="Print" i]',
-    'a[aria-label*="Print" i]',
-    'button[aria-label*="Print" i]',
-    'a[href*="download"]',
-    '.print-button',
-    '#print',
-    '.icon-print',
-    '.icon-download',
-  ];
-
-  const tryClick = async (ctx) => {
-    for (const sel of selectors) {
-      const el = await ctx.$(sel).catch(() => null);
-      if (el) {
-        await ctx
-          .evaluate((node) => {
-            const target = node.closest("a") || node;
-            target.click();
-          }, el)
-          .catch(() => {});
-        return true;
-      }
-    }
-    // fallback: buscar por texto
-    const found = await ctx
-      .evaluate(() => {
-        const all = Array.from(document.querySelectorAll("a, button"));
-        const hit = all.find((n) => /print|download|descargar|imprimir/i.test(n.textContent || n.getAttribute("title") || n.getAttribute("aria-label") || ""));
-        if (hit) {
-          (hit.closest("a") || hit).click();
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
-    return found;
-  };
-
-  // Página principal
-  if (await tryClick(page)) return true;
-  // Iframes
-  for (const frame of page.frames()) {
-    if (await tryClick(frame)) return true;
-  }
-  return false;
-}
-
-async function waitForPdf(dir, timeoutMs = 90000) {
-  const start = Date.now();
-  let lastSize = -1;
-  let stableSince = 0;
-  while (Date.now() - start < timeoutMs) {
-    const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".pdf"));
-    if (files.length > 0) {
-      const full = path.join(dir, files[0]);
-      const size = fs.statSync(full).size;
-      if (size > 0 && size === lastSize) {
-        if (Date.now() - stableSince > 1500) return full;
-      } else {
-        lastSize = size;
-        stableSince = Date.now();
-      }
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return null;
-}
-
-// ---------- rutas ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -214,49 +21,173 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post("/report-pdf", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-  const { viewUrl } = req.body || {};
-  if (!viewUrl || typeof viewUrl !== "string") {
-    return res.status(400).json({ error: "viewUrl required" });
-  }
+async function launchBrowser() {
+  return puppeteer.launch({
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--single-process",
+      "--window-size=1400,1000",
+    ],
+    defaultViewport: { width: 1400, height: 1000 },
+  });
+}
 
-  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), "ith-"));
-  let browser;
-  try {
-    const ctx = await launchBrowser(downloadDir);
-    browser = ctx.browser;
-    const { page } = ctx;
+async function login(page) {
+  await page.goto("https://app.ithenticate.com/en_us/login", {
+    waitUntil: "networkidle2",
+    timeout: 60000,
+  });
 
-    await login(page);
+  const SELECTORS =
+    'input[type="email"], input[name="email"], input[name="login"], input[name="username"], input#username, input#email, input#login';
 
-    await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 90000 });
-
-    const clicked = await clickDownloadInViewer(page);
-    if (!clicked) {
-      const html = await page.content();
-      console.error("[proxy] page snippet:", html.slice(0, 1500));
-      throw new Error("Could not find download button in iThenticate viewer");
+  const findField = async () => {
+    if (await page.$(SELECTORS)) return { frame: page, sel: SELECTORS };
+    for (const f of page.frames()) {
+      try {
+        if (await f.$(SELECTORS)) return { frame: f, sel: SELECTORS };
+      } catch {}
     }
+    return null;
+  };
 
-    const pdfPath = await waitForPdf(downloadDir);
-    if (!pdfPath) throw new Error("PDF download timed out");
+  let target = null;
+  for (let i = 0; i < 30 && !target; i++) {
+    target = await findField();
+    if (!target) await sleep(1000);
+  }
+  if (!target) {
+    const html = await page.content();
+    console.error("[proxy] login HTML head:", html.slice(0, 1500));
+    throw new Error("No se encontró el formulario de login");
+  }
 
-    const buf = fs.readFileSync(pdfPath);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Length", buf.length);
-    res.end(buf);
-  } catch (err) {
-    console.error("[proxy] /report-pdf error:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Unknown error" });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
+  await target.frame.type(target.sel, ITH_USER, { delay: 20 });
+  await target.frame.type('input[type="password"], input[name="password"]', ITH_PASS, { delay: 20 });
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }).catch(() => {}),
+    target.frame
+      .click('button[type="submit"], input[type="submit"]')
+      .catch(() => page.keyboard.press("Enter")),
+  ]);
+}
+
+async function tryClickDownload(page) {
+  const SELECTORS = [
+    'a[title*="Download" i]',
+    'button[title*="Download" i]',
+    'a[aria-label*="Download" i]',
+    'button[aria-label*="Download" i]',
+    'a[href*="download"]',
+    'a[href*=".pdf"]',
+    '.download',
+    '#download',
+    '[data-test*="download" i]',
+  ];
+
+  const tryIn = async (ctx) => {
+    for (const s of SELECTORS) {
+      const el = await ctx.$(s).catch(() => null);
+      if (el) {
+        await el.click().catch(() => {});
+        return true;
+      }
+    }
+    // text fallback
+    const handle = await ctx
+      .evaluateHandle(() => {
+        const all = Array.from(document.querySelectorAll("a,button"));
+        return all.find((e) => /download/i.test(e.textContent || "")) || null;
+      })
+      .catch(() => null);
+    if (handle) {
+      const el = handle.asElement?.();
+      if (el) {
+        await el.click().catch(() => {});
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (await tryIn(page)) return true;
+  for (const f of page.frames()) {
+    if (await tryIn(f)) return true;
+  }
+  return false;
+}
+
+app.post("/report-pdf", async (req, res) => {
+  try {
+    if (!API_KEY) return res.status(500).json({ error: "PROXY_API_KEY not set" });
+    if (req.headers["x-api-key"] !== API_KEY)
+      return res.status(401).json({ error: "Unauthorized" });
+    if (!ITH_USER || !ITH_PASS)
+      return res.status(500).json({ error: "ITHENTICATE_USERNAME/PASSWORD not set" });
+
+    const { viewUrl, mode } = req.body || {};
+    if (!viewUrl || typeof viewUrl !== "string")
+      return res.status(400).json({ error: "viewUrl required" });
+
+    const browser = await launchBrowser();
     try {
-      fs.rmSync(downloadDir, { recursive: true, force: true });
-    } catch {}
+      const page = await browser.newPage();
+      await page.setUserAgent(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      );
+
+      // Intercept any PDF response that comes through.
+      let pdfBuffer = null;
+      page.on("response", async (resp) => {
+        try {
+          const ct = (resp.headers()["content-type"] || "").toLowerCase();
+          const url = resp.url();
+          if (ct.includes("application/pdf") || /\.pdf(\?|$)/i.test(url)) {
+            const buf = await resp.buffer().catch(() => null);
+            if (buf && buf.length > 200 && buf.slice(0, 4).toString() === "%PDF") {
+              pdfBuffer = buf;
+            }
+          }
+        } catch {}
+      });
+
+      await login(page);
+      await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 90000 });
+      await sleep(RENDER_WAIT_MS);
+
+      if (mode === "official") {
+        await tryClickDownload(page);
+        const deadline = Date.now() + 90000;
+        while (!pdfBuffer && Date.now() < deadline) {
+          await sleep(500);
+        }
+      }
+
+      // Fallback: render viewer to PDF
+      if (!pdfBuffer) {
+        console.warn("[proxy] no official PDF intercepted, falling back to page.pdf()");
+        pdfBuffer = await page.pdf({
+          format: "A4",
+          printBackground: true,
+          margin: { top: "10mm", bottom: "10mm", left: "10mm", right: "10mm" },
+        });
+      }
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Length", pdfBuffer.length);
+      res.end(pdfBuffer);
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  } catch (e) {
+    console.error("[proxy] error", e);
+    res.status(500).json({ error: e?.message || "proxy error" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`[proxy] listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`[proxy] listening on ${PORT}`));
