@@ -33,7 +33,6 @@ async function login(page) {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  // Esperar el form de login
   await page.waitForSelector('input[name="email"]', { timeout: 30000 });
   await page.type('input[name="email"]', ITH_USER, { delay: 20 });
   await page.type('input[name="password"]', ITH_PASS, { delay: 20 });
@@ -46,58 +45,50 @@ async function login(page) {
 async function triggerDownload(page) {
   await sleep(RENDER_WAIT_MS);
 
-  const downloadSelectors = [
-    "#dl_btn",
-    "a#dl_btn",
-    "button#dl_btn",
-    '[title*="Download" i]',
-    '[aria-label*="Download" i]',
-    '[title*="Descargar" i]',
-    'a[href*="download"]',
-    'a[href*="dv_print"]',
-    ".download-btn",
-    ".dl-button",
-    "#print_menu",
+  // El visor de iThenticate descarga el PDF al hacer clic en el ícono de impresora.
+  const printSelectors = [
     "#print_btn",
-  ];
-
-  const subSelectors = [
+    "a#print_btn",
+    "button#print_btn",
+    "#print",
+    "#printer_btn",
+    'a[title*="Print" i]',
+    'button[title*="Print" i]',
+    '[aria-label*="Print" i]',
+    'a[title*="Imprimir" i]',
+    '[aria-label*="Imprimir" i]',
+    'a[href*="print"]',
     'a[href*="dv_print"]',
-    'a[href*="current_view"]',
-    "#current_view_pdf",
-    'a[title*="Current View" i]',
-    'a[title*="PDF" i]',
+    ".print-btn",
+    ".printer",
+    'img[src*="print" i]',
+    "i.icon-print",
   ];
 
   const contexts = [page, ...page.frames()];
 
   for (const ctx of contexts) {
-    for (const sel of downloadSelectors) {
+    for (const sel of printSelectors) {
       try {
         const el = await ctx.$(sel);
         if (!el) continue;
-        console.log(`[proxy] found download via ${sel}`);
-        await el.click().catch(() => {});
-        await sleep(1500);
-
-        for (const sub of subSelectors) {
-          try {
-            const subEl = await ctx.$(sub);
-            if (subEl) {
-              console.log(`[proxy] found submenu via ${sub}`);
-              await subEl.click().catch(() => {});
-              break;
-            }
-          } catch {}
-        }
+        console.log(`[proxy] clicking print via ${sel}`);
+        await ctx
+          .evaluate((node) => {
+            (node.closest("a") || node).click();
+          }, el)
+          .catch(async () => {
+            await el.click().catch(() => {});
+          });
+        await sleep(2000);
         return true;
       } catch {}
     }
   }
 
   const html = await page.content();
-  console.error("[proxy] page snippet:", html.slice(0, 2000));
-  throw new Error("Could not find download button in iThenticate viewer");
+  console.error("[proxy] page snippet:", html.slice(0, 3000));
+  throw new Error("Could not find print button in iThenticate viewer");
 }
 
 async function waitForPdf(dir, timeoutMs = 90000) {
@@ -109,7 +100,6 @@ async function waitForPdf(dir, timeoutMs = 90000) {
 
     if (pdf && !inProgress) {
       const full = path.join(dir, pdf);
-      // confirmar tamaño estable
       const size1 = fs.statSync(full).size;
       await sleep(800);
       const size2 = fs.statSync(full).size;
@@ -144,7 +134,7 @@ app.post("/report-pdf", auth, async (req, res) => {
     const page = await browser.newPage();
     await page.setViewport({ width: 1400, height: 1800 });
 
-    // Forzar descargas reales al directorio
+    // Forzar descargas reales al directorio temporal
     const client = await page.target().createCDPSession();
     await client.send("Page.setDownloadBehavior", {
       behavior: "allow",
