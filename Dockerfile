@@ -1,15 +1,8 @@
-# Use Puppeteer's official image — incluye Chromium + todas las libs del sistema
-FROM ghcr.io/puppeteer/puppeteer:23.5.0
-
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    NODE_ENV=production
-
+FROM node:18
 WORKDIR /app
-
 COPY package*.json ./
-RUN npm install --omit=dev
-
+RUN npm install
+# Instalamos Puppeteer para que no falle el PDF
+RUN npx puppeteer browsers install chrome
 COPY . .
-
-EXPOSE 8080
-CMD ["node", "server.js"]
+CMD ["npm", "start"]
