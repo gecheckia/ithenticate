@@ -9,7 +9,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.PROXY_API_KEY;
+const API_KEY = process.env.PROXY_API_KEY || process.env.API_KEY;
 
 // ---- helpers ----
 
