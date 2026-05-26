@@ -1,11 +1,17 @@
 {
   "name": "ithenticate-proxy",
   "version": "1.0.0",
+  "description": "Proxy para descargar el PDF oficial de iThenticate",
   "type": "module",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "puppeteer": "^23.0.0"
+    "puppeteer": "^23.5.0"
   }
 }
