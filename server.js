@@ -1,100 +1,145 @@
-import express from "express";
-import puppeteer from "puppeteer";
-import { createClient } from "@supabase/supabase-js";
+import express from 'express';
+import puppeteer from 'puppeteer';
 
-const PORT = process.env.PORT || 10000;
-const PROXY_API_KEY = process.env.PROXY_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const {
+  PORT = 8080,
+  API_KEY,
+  ITHENTICATE_USERNAME,
+  ITHENTICATE_PASSWORD,
+  ITHENTICATE_BASE_URL = 'https://www.ithenticate.com',
+  NAV_TIMEOUT_MS = 60000,
+  RENDER_WAIT_MS = 8000,
+} = process.env;
 
-if (!PROXY_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing required env vars: PROXY_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
+if (!API_KEY || !ITHENTICATE_USERNAME || !ITHENTICATE_PASSWORD) {
+  console.error('Missing required env vars: API_KEY, ITHENTICATE_USERNAME, ITHENTICATE_PASSWORD');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
-
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: '256kb' }));
 
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "ithenticate-pdf-proxy" });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-app.post("/start-job", async (req, res) => {
-  const apiKey = req.header("x-api-key");
-  if (apiKey !== PROXY_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+// ---- Auth middleware (simple shared API key) ----
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  const provided = req.header('x-api-key');
+  if (!provided || provided !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
-
-  const { viewUrl, bucket, storagePath } = req.body || {};
-  if (!viewUrl || !bucket || !storagePath) {
-    return res.status(400).json({ error: "Missing viewUrl, bucket, or storagePath" });
-  }
-
-  res.status(202).json({ ok: true, accepted: true });
-
-  renderAndUpload({ viewUrl, bucket, storagePath }).catch((err) => {
-    console.error("[renderAndUpload] failed:", err);
-  });
+  next();
 });
 
-async function renderAndUpload({ viewUrl, bucket, storagePath }) {
-  console.log(`[job] start ${storagePath}`);
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ---- Browser singleton ----
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer.launch({
+      headless: 'new',
       args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process',
       ],
     });
+  }
+  return browserPromise;
+}
 
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 1800 });
+async function loginAndGetCookies(page) {
+  await page.goto(`${ITHENTICATE_BASE_URL}/en_us/login`, {
+    waitUntil: 'networkidle2',
+    timeout: Number(NAV_TIMEOUT_MS),
+  });
 
-    await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 120000 });
-    await new Promise((r) => setTimeout(r, 120000));
+  // iThenticate login form (email + password)
+  await page.waitForSelector('input[name="email"]', { timeout: 30000 });
+  await page.type('input[name="email"]', ITHENTICATE_USERNAME, { delay: 20 });
+  await page.type('input[name="password"]', ITHENTICATE_PASSWORD, { delay: 20 });
 
-    const pdf = await page.pdf({
-      format: "A4",
-      printBackground: true,
-      margin: { top: "10mm", bottom: "10mm", left: "10mm", right: "10mm" },
-    });
+  await Promise.all([
+    page.click('button[type="submit"], input[type="submit"]'),
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: Number(NAV_TIMEOUT_MS) }),
+  ]);
 
-    const { error: uploadError } = await supabase.storage
-      .from(bucket)
-      .upload(storagePath, pdf, {
-        contentType: "application/pdf",
-        upsert: true,
-      });
-
-    if (uploadError) {
-      console.error("[job] upload error:", uploadError);
-      return;
-    }
-
-    console.log(`[job] done ${storagePath}`);
-  } catch (err) {
-    console.error("[job] error:", err);
-  } finally {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
+  const url = page.url();
+  if (/login/i.test(url)) {
+    throw new Error('Login failed: still on login page. Check credentials.');
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`ithenticate-pdf-proxy listening on :${PORT}`);
+/**
+ * POST /report-pdf
+ * Body: { viewUrl?: string, documentId?: string }
+ *
+ * - If `viewUrl` is provided (the iThenticate view_only_url from your XML-RPC
+ *   report.get response), the bot opens it directly. This is the recommended path.
+ * - If only `documentId` is provided, the bot navigates to the document inside
+ *   the authenticated session.
+ *
+ * Returns: application/pdf stream
+ */
+app.post('/report-pdf', async (req, res) => {
+  const { viewUrl, documentId } = req.body || {};
+  if (!viewUrl && !documentId) {
+    return res.status(400).json({ error: 'Provide viewUrl or documentId' });
+  }
+
+  let page;
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 1 });
+
+    // The view_only_url already embeds an auth token, but logging in first
+    // makes the session more reliable across redirects.
+    await loginAndGetCookies(page);
+
+    const targetUrl = viewUrl
+      ? viewUrl
+      : `${ITHENTICATE_BASE_URL}/en_us/dv?o=${encodeURIComponent(documentId)}`;
+
+    await page.goto(targetUrl, {
+      waitUntil: 'networkidle2',
+      timeout: Number(NAV_TIMEOUT_MS),
+    });
+
+    // The similarity viewer is a JS-heavy SPA — give it time to fully render.
+    await new Promise((r) => setTimeout(r, Number(RENDER_WAIT_MS)));
+
+    const pdf = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '12mm', right: '10mm', bottom: '12mm', left: '10mm' },
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="similarity-report.pdf"');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(pdf);
+  } catch (err) {
+    console.error('report-pdf error:', err);
+    res.status(500).json({ error: err.message || 'Failed to generate PDF' });
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
 });
+
+app.listen(PORT, () => {
+  console.log(`iThenticate PDF proxy listening on :${PORT}`);
+});
+
+// Graceful shutdown
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, async () => {
+    try {
+      const b = await browserPromise;
+      if (b) await b.close();
+    } catch {}
+    process.exit(0);
+  });
+}
