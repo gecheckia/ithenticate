@@ -38,7 +38,6 @@ app.post("/start-job", async (req, res) => {
     return res.status(400).json({ error: "Missing viewUrl, bucket, or storagePath" });
   }
 
-  // Respond immediately; render in background
   res.status(202).json({ ok: true, accepted: true });
 
   renderAndUpload({ viewUrl, bucket, storagePath }).catch((err) => {
