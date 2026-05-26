@@ -1,0 +1,17 @@
+{
+  "name": "ithenticate-pdf-proxy",
+  "version": "1.0.0",
+  "description": "Headless browser proxy that logs into iThenticate and returns the similarity report as a PDF stream.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "puppeteer": "^23.5.0"
+  }
+}

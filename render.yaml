@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ithenticate-pdf-proxy
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: ITHENTICATE_USERNAME
+        sync: false
+      - key: ITHENTICATE_PASSWORD
+        sync: false
+      - key: ITHENTICATE_BASE_URL
+        value: https://www.ithenticate.com
+      - key: RENDER_WAIT_MS
+        value: "8000"
