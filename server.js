@@ -1,246 +1,161 @@
-// server.js  -- proxy iThenticate -> PDF oficial
+// server.js — async iThenticate PDF proxy with Supabase Storage upload
 import express from "express";
 import puppeteer from "puppeteer";
-import fs from "fs";
-import path from "path";
-import os from "os";
-
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.PROXY_API_KEY || process.env.API_KEY;
-const USER = process.env.ITHENTICATE_USERNAME;
-const PASS = process.env.ITHENTICATE_PASSWORD;
-const RENDER_WAIT_MS = parseInt(process.env.RENDER_WAIT_MS || "8000", 10);
-const DOWNLOAD_TIMEOUT_MS = 120_000;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-const log = (...a) => console.log("[proxy]", ...a);
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.PROXY_API_KEY;
+const ITH_USER = process.env.ITHENTICATE_USERNAME;
+const ITH_PASS = process.env.ITHENTICATE_PASSWORD;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const RENDER_WAIT_MS = parseInt(process.env.RENDER_WAIT_MS || "8000", 10);
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    apiKey: !!API_KEY,
-    ithenticate: !!(USER && PASS),
+if (!API_KEY || !ITH_USER || !ITH_PASS || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error("[proxy] missing required env vars");
+  process.exit(1);
+}
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Returns 202 immediately, processes in background.
+app.post("/start-job", async (req, res) => {
+  if (req.header("x-api-key") !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { viewUrl, bucket, storagePath } = req.body || {};
+  if (!viewUrl || !bucket || !storagePath) {
+    return res.status(400).json({ error: "Missing viewUrl/bucket/storagePath" });
+  }
+
+  res.status(202).json({ accepted: true, storagePath });
+
+  // Background work — don't await
+  processJob({ viewUrl, bucket, storagePath }).catch((e) => {
+    console.error("[proxy] job failed", storagePath, e?.message || e);
   });
 });
 
-async function launchBrowser(downloadDir) {
+async function processJob({ viewUrl, bucket, storagePath }) {
+  console.log("[proxy] start job", storagePath);
   const browser = await puppeteer.launch({
     headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--single-process",
-      "--window-size=1400,1000",
-    ],
-  });
-  return browser;
-}
-
-async function login(page) {
-  log("login -> https://app.ithenticate.com/en_us/login");
-  await page.goto("https://app.ithenticate.com/en_us/login", {
-    waitUntil: "domcontentloaded",
-    timeout: 60_000,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
   });
 
-  // Wait for either email or password input
-  let ok = false;
-  for (let i = 0; i < 30; i++) {
-    const has = await page.evaluate(() => {
-      return !!(
-        document.querySelector('input[type="email"], input[name="email"], input[name="username"], input[id*="email" i], input[id*="user" i]') &&
-        document.querySelector('input[type="password"]')
-      );
-    });
-    if (has) { ok = true; break; }
-    await new Promise(r => setTimeout(r, 500));
-  }
-  if (!ok) {
-    const head = await page.evaluate(() => document.documentElement.outerHTML.slice(0, 600));
-    log("login HTML head:", head);
-    throw new Error("login form not found");
-  }
+  let pdfBuffer = null;
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1400, height: 1800 });
 
-  await page.evaluate((u, p) => {
-    const email = document.querySelector('input[type="email"], input[name="email"], input[name="username"], input[id*="email" i], input[id*="user" i]');
-    const pwd   = document.querySelector('input[type="password"]');
-    if (email) { email.focus(); email.value = u; email.dispatchEvent(new Event("input", {bubbles:true})); }
-    if (pwd)   { pwd.focus();   pwd.value = p;   pwd.dispatchEvent(new Event("input", {bubbles:true})); }
-  }, USER, PASS);
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => null),
-    page.evaluate(() => {
-      const btn = document.querySelector('button[type="submit"], input[type="submit"]');
-      if (btn) btn.click();
-      else document.querySelector("form")?.submit();
-    }),
-  ]);
-  log("login done, url:", page.url());
-}
-
-async function clickDownload(page) {
-  // Try selectors first
-  const selectors = [
-    'a[title*="Download" i]',
-    'a[aria-label*="Download" i]',
-    'button[title*="Download" i]',
-    'button[aria-label*="Download" i]',
-    'a[href*="download"]',
-    '#download', '.download', '.dl-icon', '.icon-download',
-    'a[title*="Print" i]', 'button[title*="Print" i]',
-  ];
-
-  const frames = [page, ...page.frames()];
-  for (const f of frames) {
-    for (const sel of selectors) {
+    // Capture official PDF from network
+    page.on("response", async (response) => {
       try {
-        const el = await f.$(sel);
-        if (el) {
-          log("clicking selector:", sel, "in", f === page ? "main" : "frame");
-          await el.click().catch(() => {});
-          return true;
+        const ct = response.headers()["content-type"] || "";
+        if (ct.includes("application/pdf")) {
+          const buf = await response.buffer();
+          if (buf.length > 200 && buf[0] === 0x25 && buf[1] === 0x50) {
+            pdfBuffer = buf;
+            console.log("[proxy] captured pdf from network", buf.length, "bytes");
+          }
         }
       } catch {}
-    }
-  }
-
-  // Text-based fallback
-  for (const f of frames) {
-    const clicked = await f.evaluate(() => {
-      const all = Array.from(document.querySelectorAll("a, button, [role=button]"));
-      const m = all.find(e => {
-        const t = (e.innerText || e.textContent || "").trim().toLowerCase();
-        const title = (e.getAttribute("title") || "").toLowerCase();
-        const aria  = (e.getAttribute("aria-label") || "").toLowerCase();
-        return /download|descargar|print|imprimir/.test(t + " " + title + " " + aria);
-      });
-      if (m) { m.click(); return true; }
-      return false;
-    }).catch(() => false);
-    if (clicked) { log("clicked via text match"); return true; }
-  }
-
-  return false;
-}
-
-app.post("/report-pdf", async (req, res) => {
-  if (!API_KEY || req.headers["x-api-key"] !== API_KEY) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
-  if (!USER || !PASS) {
-    return res.status(500).json({ error: "missing iThenticate credentials" });
-  }
-  const { viewUrl } = req.body || {};
-  if (!viewUrl || typeof viewUrl !== "string") {
-    return res.status(400).json({ error: "missing viewUrl" });
-  }
-
-  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), "ith-"));
-  let browser;
-  try {
-    browser = await launchBrowser(downloadDir);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1400, height: 1000 });
-
-    // 1) Capture any application/pdf response
-    let capturedPdf = null;
-    const pdfPromise = new Promise((resolve) => {
-      page.on("response", async (resp) => {
-        try {
-          const ct = (resp.headers()["content-type"] || "").toLowerCase();
-          const url = resp.url();
-          if (ct.includes("application/pdf") || /\.pdf(\?|$)/i.test(url)) {
-            log("intercepted PDF response:", url, ct);
-            const buf = await resp.buffer().catch(() => null);
-            if (buf && buf.length > 200 && buf.slice(0,4).toString() === "%PDF") {
-              capturedPdf = buf;
-              resolve(buf);
-            }
-          }
-        } catch {}
-      });
     });
 
-    // 2) Force any download to land in downloadDir
-    const client = await page.target().createCDPSession();
-    await client.send("Page.setDownloadBehavior", {
-      behavior: "allow",
-      downloadPath: downloadDir,
+    // 1) Open view_only_url
+    await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 60000 });
+
+    // 2) Login if needed
+    const needsLogin = await page.evaluate(() => {
+      return !!document.querySelector('input[type="email"], input[name="email"], input[name="login"], input[name="username"]');
     });
-
-    // 3) Login
-    await login(page);
-
-    // 4) Open the view-only report
-    log("open report:", viewUrl);
-    await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 90_000 });
-    await new Promise(r => setTimeout(r, RENDER_WAIT_MS));
-
-    // 5) Click download/print
-    const clicked = await clickDownload(page);
-    if (!clicked) {
-      log("no download control found");
-      // dump some info to help debug
-      const titles = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll("a, button"))
-          .map(e => (e.getAttribute("title") || e.getAttribute("aria-label") || e.innerText || "").trim())
-          .filter(Boolean).slice(0, 40);
-      });
-      log("candidates:", titles);
-      throw new Error("download button not found");
+    if (needsLogin) {
+      console.log("[proxy] login required");
+      const emailSel = 'input[type="email"], input[name="email"], input[name="login"], input[name="username"]';
+      await page.waitForSelector(emailSel, { timeout: 30000 });
+      await page.type(emailSel, ITH_USER, { delay: 20 });
+      await page.type('input[type="password"], input[name="password"]', ITH_PASS, { delay: 20 });
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }).catch(() => {}),
+        page.click('button[type="submit"], input[type="submit"]'),
+      ]);
+      console.log("[proxy] login submitted");
     }
 
-    // 6) Wait for either an HTTP-intercepted PDF or a downloaded file
-    const startedAt = Date.now();
-    let pdfBuf = null;
+    // 3) Wait for viewer to render
+    await new Promise((r) => setTimeout(r, RENDER_WAIT_MS));
 
-    while (Date.now() - startedAt < DOWNLOAD_TIMEOUT_MS && !pdfBuf) {
-      if (capturedPdf) { pdfBuf = capturedPdf; break; }
-      // poll downloadDir for a stable .pdf
-      const files = fs.readdirSync(downloadDir).filter(f => f.toLowerCase().endsWith(".pdf"));
-      if (files.length) {
-        const fp = path.join(downloadDir, files[0]);
-        const s1 = fs.statSync(fp).size;
-        await new Promise(r => setTimeout(r, 1500));
-        const s2 = fs.statSync(fp).size;
-        if (s1 === s2 && s2 > 200) {
-          pdfBuf = fs.readFileSync(fp);
-          if (pdfBuf.slice(0,4).toString() !== "%PDF") pdfBuf = null;
-          else break;
+    // 4) Click the official download button (try many selectors + frames)
+    const clickInFrame = async (frame) => {
+      const selectors = [
+        'a[title*="Download" i]',
+        'button[title*="Download" i]',
+        'a[aria-label*="Download" i]',
+        'button[aria-label*="Download" i]',
+        'a[href*="download"]',
+        '#download-button',
+        '.download-icon',
+        'a.download',
+        'button.download',
+      ];
+      for (const sel of selectors) {
+        const el = await frame.$(sel);
+        if (el) {
+          await el.click().catch(() => {});
+          console.log("[proxy] clicked", sel);
+          return true;
         }
       }
-      await new Promise(r => setTimeout(r, 1000));
+      // Text-based fallback
+      const clicked = await frame.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("a, button"));
+        const target = all.find((el) => /download/i.test(el.textContent || "") || /download/i.test(el.getAttribute("title") || "") || /download/i.test(el.getAttribute("aria-label") || ""));
+        if (target) { target.click(); return true; }
+        return false;
+      });
+      if (clicked) console.log("[proxy] clicked via text fallback");
+      return clicked;
+    };
+
+    let clicked = await clickInFrame(page);
+    if (!clicked) {
+      for (const frame of page.frames()) {
+        clicked = await clickInFrame(frame);
+        if (clicked) break;
+      }
     }
 
-    if (!pdfBuf) {
-      // give the interceptor a last chance
-      pdfBuf = await Promise.race([
-        pdfPromise,
-        new Promise(r => setTimeout(() => r(null), 5000)),
-      ]);
+    // 5) Wait up to 90s for the PDF to be captured
+    const deadline = Date.now() + 90_000;
+    while (!pdfBuffer && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
     }
 
-    if (!pdfBuf) {
-      throw new Error("official PDF not received within timeout");
+    if (!pdfBuffer) {
+      throw new Error("Official PDF not captured within 90s");
     }
-
-    log("returning official PDF, bytes:", pdfBuf.length);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Length", pdfBuf.length);
-    res.end(pdfBuf);
-  } catch (e) {
-    log("ERROR:", e?.message || e);
-    res.status(500).json({ error: String(e?.message || e) });
   } finally {
-    try { await browser?.close(); } catch {}
-    try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
+    await browser.close().catch(() => {});
   }
-});
 
-app.listen(PORT, () => log("listening on", PORT));
+  // 6) Upload to Supabase Storage
+  const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${bucket}/${storagePath}`;
+  const upRes = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/pdf",
+      "x-upsert": "true",
+    },
+    body: pdfBuffer,
+  });
+  if (!upRes.ok) {
+    const txt = await upRes.text().catch(() => "");
+    throw new Error(`Supabase upload failed ${upRes.status}: ${txt.slice(0, 300)}`);
+  }
+  console.log("[proxy] uploaded", storagePath, pdfBuffer.length, "bytes");
+}
 
+app.listen(PORT, () => console.log(`[proxy] listening on ${PORT}`));
