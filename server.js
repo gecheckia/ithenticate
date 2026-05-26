@@ -8,16 +8,16 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing env vars: PROXY_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
+  console.error("Faltan variables de entorno: PROXY_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
+  auth: { persistSession: false, autoRefreshToken: false },
 });
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (_req, res) => res.send("ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -28,19 +28,19 @@ app.post("/start-job", (req, res) => {
   }
   const { viewUrl, bucket, storagePath } = req.body || {};
   if (!viewUrl || !bucket || !storagePath) {
-    return res.status(400).json({ error: "missing fields" });
+    return res.status(400).json({ error: "missing viewUrl/bucket/storagePath" });
   }
 
-  // Respond immediately, render in background
+  // Responde 202 de inmediato y procesa en background
   res.status(202).json({ accepted: true });
 
   renderAndUpload({ viewUrl, bucket, storagePath }).catch((err) => {
-    console.error("[job failed]", storagePath, err);
+    console.error("[job] error:", err?.message || err);
   });
 });
 
 async function renderAndUpload({ viewUrl, bucket, storagePath }) {
-  console.log("[job start]", storagePath);
+  console.log("[job] start", storagePath);
   const browser = await puppeteer.launch({
     headless: true,
     args: [
@@ -55,13 +55,12 @@ async function renderAndUpload({ viewUrl, bucket, storagePath }) {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 1800 });
     await page.goto(viewUrl, { waitUntil: "networkidle2", timeout: 120_000 });
-    // Give the iThenticate viewer a moment to fully paint
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, 8000)); // deja que renderice el informe
 
     const pdf = await page.pdf({
       format: "A4",
       printBackground: true,
-      margin: { top: "12mm", bottom: "12mm", left: "10mm", right: "10mm" },
+      margin: { top: "12mm", right: "10mm", bottom: "12mm", left: "10mm" },
     });
 
     const { error } = await supabase.storage
@@ -72,12 +71,12 @@ async function renderAndUpload({ viewUrl, bucket, storagePath }) {
       });
 
     if (error) throw error;
-    console.log("[job done]", storagePath);
+    console.log("[job] uploaded", storagePath);
   } finally {
-    await browser.close().catch(() => {});
+    await browser.close();
   }
 }
 
 app.listen(PORT, () => {
-  console.log(`PDF proxy listening on :${PORT}`);
+  console.log(`proxy listo en :${PORT}`);
 });
